@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>複数人の視線（顔の向き）・姿勢推定デモ</title>
+    <style>
+        body { margin: 0; background-color: #222; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; box-sizing: border-box; }
+        .controls { margin-bottom: 15px; display: flex; gap: 10px; align-items: center; }
+        .controls button { padding: 10px 20px; font-size: 1rem; cursor: pointer; border: none; border-radius: 5px; }
+        .controls button.active { background-color: #4CAF50; color: white; }
+        .controls button:not(.active) { background-color: #555; color: white; }
+        .controls button:hover { opacity: 0.8; }
+        #fileInput { display: none; }
+        #uploadBtn { background-color: #2196F3 !important; }
+        .video-controls { margin-top: 10px; display: none; gap: 10px; align-items: center; }
+        .video-controls button { padding: 8px 15px; font-size: 0.9rem; cursor: pointer; border: none; border-radius: 5px; background-color: #555; color: white; }
+        .video-controls button:hover { opacity: 0.8; }
+        .container { position: relative; width: 640px; height: 480px; background: #000; border: 2px solid #555; }
+        video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        video.mirror { transform: scaleX(-1); }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        canvas.mirror { transform: scaleX(-1); }
+        .status { margin-top: 10px; font-size: 1.2rem; }
+        .stats { margin-top: 10px; font-size: 1rem; display: flex; gap: 20px; }
+        .stats span { padding: 5px 10px; border-radius: 5px; }
+        .standing { background-color: #4CAF50; }
+        .sitting { background-color: #FF9800; }
+        .unknown-pose { background-color: #888; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <!-- TensorFlow.js と MoveNet for multi-person pose -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+</head>
+<body>
+
+    <div class="controls">
+        <button id="cameraModeBtn" class="active">カメラモード</button>
+        <button id="videoModeBtn">動画モード</button>
+        <input type="file" id="fileInput" accept="video/*,.mp4,.mov,.webm,.avi,.mkv,.m4v,.ogv,video/mp4,video/quicktime,video/webm,video/x-msvideo">
+        <button id="uploadBtn" style="display: none;">動画をアップロード</button>
+    </div>
+    <div class="status">モデルを読み込み中...</div>
+    <div class="container">
+        <video class="input_video mirror" autoplay playsinline muted></video>
+        <canvas class="output_canvas mirror" width="640" height="480"></canvas>
+    </div>
+    <div class="video-controls" id="videoControls">
+        <button id="playPauseBtn">再生</button>
+        <button id="restartBtn">最初から</button>
+    </div>
+    <div class="stats" id="stats">
+        <span class="standing">立っている: <span id="standingCount">0</span>人</span>
+        <span class="sitting">座っている: <span id="sittingCount">0</span>人</span>
+        <span class="unknown-pose">不明: <span id="unknownCount">0</span>人</span>
+    </div>
+
+<script>
+    const videoElement = document.getElementsByClassName('input_video')[0];
+    const canvasElement = document.getElementsByClassName('output_canvas')[0];
+    const canvasCtx = canvasElement.getContext('2d');
+    const statusText = document.querySelector('.status');
+    const standingCountEl = document.getElementById('standingCount');
+    const sittingCountEl = document.getElementById('sittingCount');
+    const unknownCountEl = document.getElementById('unknownCount');
+
+    const cameraModeBtn = document.getElementById('cameraModeBtn');
+    const videoModeBtn = document.getElementById('videoModeBtn');
+    const fileInput = document.getElementById('fileInput');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const videoControls = document.getElementById('videoControls');
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    const restartBtn = document.getElementById('restartBtn');
+
+    let currentMode = 'camera';
+    let camera = null;
+    let videoAnimationId = null;
+    let isMirrored = true;
+
+    // 検出結果を保存
+    let lastFaceResults = null;
+    let lastPoseResults = null; // MoveNet用（複数人）
+    let lastImage = null;
+
+    // MoveNet detector
+    let poseDetector = null;
+
+    // ■ 顔の向きを判定する簡易関数
+    function estimateHeadPose(landmarks) {
+        const nose = landmarks[1];
+        const leftCheek = landmarks[234];
+        const rightCheek = landmarks[454];
+        const topHead = landmarks[10];
+        const chin = landmarks[152];
+
+        const faceWidth = Math.abs(rightCheek.x - leftCheek.x);
+        const noseDistFromLeft = Math.abs(nose.x - leftCheek.x);
+        const yawRatio = noseDistFromLeft / faceWidth;
+
+        const faceHeight = Math.abs(chin.y - topHead.y);
+        const noseDistFromTop = Math.abs(nose.y - topHead.y);
+        const pitchRatio = noseDistFromTop / faceHeight;
+
+        let direction = "正面";
+        let color = "#00FF00";
+
+        if (isMirrored) {
+            if (yawRatio < 0.40) { direction = "右"; color = "#FF0000"; }
+            else if (yawRatio > 0.60) { direction = "左"; color = "#0000FF"; }
+        } else {
+            if (yawRatio < 0.40) { direction = "左"; color = "#0000FF"; }
+            else if (yawRatio > 0.60) { direction = "右"; color = "#FF0000"; }
+        }
+
+        if (pitchRatio < 0.40) { direction = "上"; color = "#FFFF00"; }
+        else if (pitchRatio > 0.60) { direction = "下"; color = "#FFFF00"; }
+
+        return { x: nose.x, y: nose.y, direction: direction, color: color };
+    }
+
+    // ■ MoveNet用キーポイント名
+    // 0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear
+    // 5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow
+    // 9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip
+    // 13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle
+
+    // ■ 立ち/座り判定（MoveNetキーポイントから）
+    function estimatePostureFromMoveNet(keypoints) {
+        // キーポイントを名前でアクセスしやすく
+        const getKeypoint = (name) => keypoints.find(kp => kp.name === name);
+
+        const leftShoulder = getKeypoint('left_shoulder');
+        const rightShoulder = getKeypoint('right_shoulder');
+        const leftHip = getKeypoint('left_hip');
+        const rightHip = getKeypoint('right_hip');
+        const leftKnee = getKeypoint('left_knee');
+        const rightKnee = getKeypoint('right_knee');
+
+        // 信頼度チェック
+        const minScore = 0.3;
+        const hasHips = (leftHip?.score > minScore || rightHip?.score > minScore);
+        const hasKnees = (leftKnee?.score > minScore || rightKnee?.score > minScore);
+        const hasShoulders = (leftShoulder?.score > minScore || rightShoulder?.score > minScore);
+
+        if (!hasHips || !hasShoulders) {
+            return { posture: "?", color: "#888888" };
+        }
+
+        // 肩のY座標（平均、有効なもののみ）
+        let shoulderY = 0, shoulderCount = 0;
+        if (leftShoulder?.score > minScore) { shoulderY += leftShoulder.y; shoulderCount++; }
+        if (rightShoulder?.score > minScore) { shoulderY += rightShoulder.y; shoulderCount++; }
+        shoulderY /= shoulderCount;
+
+        // 腰のY座標（平均）
+        let hipY = 0, hipCount = 0;
+        if (leftHip?.score > minScore) { hipY += leftHip.y; hipCount++; }
+        if (rightHip?.score > minScore) { hipY += rightHip.y; hipCount++; }
+        hipY /= hipCount;
+
+        // 膝が見えない場合は判定不能
+        if (!hasKnees) {
+            return { posture: "?", color: "#888888" };
+        }
+
+        // 膝のY座標（平均）
+        let kneeY = 0, kneeCount = 0;
+        if (leftKnee?.score > minScore) { kneeY += leftKnee.y; kneeCount++; }
+        if (rightKnee?.score > minScore) { kneeY += rightKnee.y; kneeCount++; }
+        kneeY /= kneeCount;
+
+        // 胴体の高さ（肩から腰）
+        const torsoHeight = hipY - shoulderY;
+        // 腰から膝までの距離
+        const hipToKnee = kneeY - hipY;
+
+        // 判定: torsoHeightが0以下の場合は異常値
+        if (torsoHeight <= 0) {
+            return { posture: "?", color: "#888888" };
+        }
+
+        const ratio = hipToKnee / torsoHeight;
+
+        // 座っている: 膝が腰に近い（ratio < 0.7）
+        // 立っている: 膝が腰から離れている（ratio >= 0.7）
+        if (ratio < 0.6) {
+            return { posture: "座", color: "#FF9800" };
+        } else {
+            return { posture: "立", color: "#4CAF50" };
+        }
+    }
+
+    // ■ 頭の位置を取得（MoveNet）
+    function getHeadPosition(keypoints, scaleX, scaleY) {
+        const nose = keypoints.find(kp => kp.name === 'nose');
+        const leftEye = keypoints.find(kp => kp.name === 'left_eye');
+        const rightEye = keypoints.find(kp => kp.name === 'right_eye');
+
+        let x = 0, y = 0, count = 0;
+        if (nose?.score > 0.3) { x += nose.x; y += nose.y; count++; }
+        if (leftEye?.score > 0.3) { x += leftEye.x; y += leftEye.y; count++; }
+        if (rightEye?.score > 0.3) { x += rightEye.x; y += rightEye.y; count++; }
+
+        if (count === 0) return null;
+        // 頭の上に表示するため、少し上にオフセット
+        return { x: (x / count) * scaleX, y: ((y / count) * scaleY) - 30 };
+    }
+
+    // ■ スケルトン接続定義（MoveNet）
+    const SKELETON_CONNECTIONS = [
+        ['nose', 'left_eye'],
+        ['nose', 'right_eye'],
+        ['left_eye', 'left_ear'],
+        ['right_eye', 'right_ear'],
+        ['left_shoulder', 'right_shoulder'],
+        ['left_shoulder', 'left_elbow'],
+        ['right_shoulder', 'right_elbow'],
+        ['left_elbow', 'left_wrist'],
+        ['right_elbow', 'right_wrist'],
+        ['left_shoulder', 'left_hip'],
+        ['right_shoulder', 'right_hip'],
+        ['left_hip', 'right_hip'],
+        ['left_hip', 'left_knee'],
+        ['right_hip', 'right_knee'],
+        ['left_knee', 'left_ankle'],
+        ['right_knee', 'right_ankle']
+    ];
+
+    // ■ スケルトン描画
+    function drawSkeleton(keypoints, color, scaleX, scaleY) {
+        const minScore = 0.3;
+
+        // キーポイントをマップに変換
+        const keypointMap = {};
+        for (const kp of keypoints) {
+            keypointMap[kp.name] = kp;
+        }
+
+        // 接続線を描画
+        canvasCtx.strokeStyle = color;
+        canvasCtx.lineWidth = 3;
+
+        for (const [start, end] of SKELETON_CONNECTIONS) {
+            const startKp = keypointMap[start];
+            const endKp = keypointMap[end];
+
+            if (startKp?.score > minScore && endKp?.score > minScore) {
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(startKp.x * scaleX, startKp.y * scaleY);
+                canvasCtx.lineTo(endKp.x * scaleX, endKp.y * scaleY);
+                canvasCtx.stroke();
+            }
+        }
+
+        // キーポイント（関節）を描画
+        for (const kp of keypoints) {
+            if (kp.score > minScore) {
+                canvasCtx.beginPath();
+                canvasCtx.arc(kp.x * scaleX, kp.y * scaleY, 5, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = color;
+                canvasCtx.fill();
+                canvasCtx.strokeStyle = '#000';
+                canvasCtx.lineWidth = 1;
+                canvasCtx.stroke();
+            }
+        }
+    }
+
+    // ■ 描画処理
+    function renderResults() {
+        if (!lastImage) return;
+
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(lastImage, 0, 0, canvasElement.width, canvasElement.height);
+
+        // MoveNetの座標をキャンバスにスケーリングするための係数
+        // MoveNetはビデオの実際のサイズ（videoWidth/videoHeight）に対するピクセル座標を返す
+        const videoWidth = lastImage.videoWidth || lastImage.width || canvasElement.width;
+        const videoHeight = lastImage.videoHeight || lastImage.height || canvasElement.height;
+        const scaleX = canvasElement.width / videoWidth;
+        const scaleY = canvasElement.height / videoHeight;
+
+        let standingCount = 0;
+        let sittingCount = 0;
+        let unknownCount = 0;
+
+        // MoveNet Pose結果の描画（複数人姿勢判定）
+        if (lastPoseResults && lastPoseResults.length > 0) {
+            for (const person of lastPoseResults) {
+                const posture = estimatePostureFromMoveNet(person.keypoints);
+
+                if (posture.posture === "立") standingCount++;
+                else if (posture.posture === "座") sittingCount++;
+                else unknownCount++;
+
+                // スケルトン（骨格線）を描画
+                drawSkeleton(person.keypoints, posture.color, scaleX, scaleY);
+
+                // 腰の位置に姿勢を表示
+                const hipPos = getHipPosition(person.keypoints, scaleX, scaleY);
+                if (hipPos) {
+                    const px = hipPos.x;
+                    const py = hipPos.y;
+
+                    canvasCtx.save();
+                    canvasCtx.translate(px, py);
+                    if (isMirrored) canvasCtx.scale(-1, 1);
+                    canvasCtx.font = "bold 28px Arial";
+                    canvasCtx.fillStyle = posture.color;
+                    canvasCtx.strokeStyle = "#000";
+                    canvasCtx.lineWidth = 3;
+                    canvasCtx.strokeText(posture.posture, 0, 0);
+                    canvasCtx.fillText(posture.posture, 0, 0);
+                    canvasCtx.restore();
+                }
+            }
+        }
+
+        // 顔検出結果の描画
+        if (lastFaceResults && lastFaceResults.multiFaceLandmarks) {
+            for (const landmarks of lastFaceResults.multiFaceLandmarks) {
+                const pose = estimateHeadPose(landmarks);
+                const px = pose.x * canvasElement.width;
+                const py = pose.y * canvasElement.height;
+
+                canvasCtx.beginPath();
+                canvasCtx.arc(px, py, 10, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = pose.color;
+                canvasCtx.fill();
+
+                canvasCtx.save();
+                canvasCtx.translate(px + 15, py - 20);
+                if (isMirrored) canvasCtx.scale(-1, 1);
+                canvasCtx.font = "30px Arial";
+                canvasCtx.fillStyle = pose.color;
+                canvasCtx.fillText(pose.direction, 0, 0);
+                canvasCtx.restore();
+            }
+        }
+
+        canvasCtx.restore();
+
+        // カウント更新
+        standingCountEl.innerText = standingCount;
+        sittingCountEl.innerText = sittingCount;
+        unknownCountEl.innerText = unknownCount;
+
+        const faceCount = lastFaceResults?.multiFaceLandmarks?.length || 0;
+        const poseCount = lastPoseResults?.length || 0;
+        statusText.innerText = (currentMode === 'camera' ? "カメラ" : "動画") +
+            " - 顔: " + faceCount + "人 / 姿勢: " + poseCount + "人";
+    }
+
+    // ■ FaceMesh結果
+    function onFaceResults(results) {
+        lastFaceResults = results;
+        lastImage = results.image;
+        renderResults();
+    }
+
+    // ■ MediaPipe FaceMeshの設定
+    const faceMesh = new FaceMesh({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+    }});
+
+    faceMesh.setOptions({
+        maxNumFaces: 10,
+        refineLandmarks: true,
+        minDetectionConfidence: 0.3,
+        minTrackingConfidence: 0.3
+    });
+    faceMesh.onResults(onFaceResults);
+
+    // ■ MoveNet MultiPose初期化
+    async function initMoveNet() {
+        statusText.innerText = 'MoveNetモデルを読み込み中...';
+        await tf.setBackend('webgl');
+        await tf.ready();
+
+        const model = poseDetection.SupportedModels.MoveNet;
+        poseDetector = await poseDetection.createDetector(model, {
+            modelType: poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,
+            enableSmoothing: true,
+            minPoseScore: 0.25
+        });
+
+        statusText.innerText = 'モデル読み込み完了！カメラを許可してください...';
+        console.log('MoveNet MultiPose loaded');
+    }
+
+    // ■ MoveNetで姿勢検出
+    async function detectPoses(image) {
+        if (!poseDetector) return [];
+        try {
+            const poses = await poseDetector.estimatePoses(image);
+            return poses;
+        } catch (e) {
+            console.error('Pose detection error:', e);
+            return [];
+        }
+    }
+
+    // ■ カメラモード開始
+    async function startCameraMode() {
+        stopVideoMode();
+        currentMode = 'camera';
+        isMirrored = true;
+        videoElement.classList.add('mirror');
+        canvasElement.classList.add('mirror');
+
+        cameraModeBtn.classList.add('active');
+        videoModeBtn.classList.remove('active');
+        uploadBtn.style.display = 'none';
+        videoControls.style.display = 'none';
+
+        statusText.innerText = 'カメラを許可して少しお待ちください...';
+
+        camera = new Camera(videoElement, {
+            onFrame: async () => {
+                // FaceMesh
+                await faceMesh.send({image: videoElement});
+                // MoveNet MultiPose
+                lastPoseResults = await detectPoses(videoElement);
+                lastImage = videoElement;
+                renderResults();
+            },
+            width: 640,
+            height: 480
+        });
+        camera.start();
+    }
+
+    // ■ カメラモード停止
+    function stopCameraMode() {
+        if (camera) {
+            camera.stop();
+            camera = null;
+        }
+        if (videoElement.srcObject) {
+            const tracks = videoElement.srcObject.getTracks();
+            tracks.forEach(track => track.stop());
+            videoElement.srcObject = null;
+        }
+    }
+
+    // ■ 動画モード開始
+    function startVideoMode() {
+        stopCameraMode();
+        currentMode = 'video';
+        isMirrored = false;
+        videoElement.classList.remove('mirror');
+        canvasElement.classList.remove('mirror');
+
+        cameraModeBtn.classList.remove('active');
+        videoModeBtn.classList.add('active');
+        uploadBtn.style.display = 'inline-block';
+        videoControls.style.display = 'flex';
+
+        fileInput.value = '';
+
+        statusText.innerText = '動画をアップロードしてください';
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    }
+
+    // ■ 動画モード停止
+    function stopVideoMode() {
+        if (videoAnimationId) {
+            cancelAnimationFrame(videoAnimationId);
+            videoAnimationId = null;
+        }
+        videoElement.pause();
+        videoElement.removeAttribute('src');
+        videoElement.load();
+    }
+
+    // ■ 動画ファイル処理
+    async function processVideoFrame() {
+        if (videoElement.paused || videoElement.ended) {
+            if (videoElement.ended) {
+                statusText.innerText = '動画 - 再生終了';
+                playPauseBtn.innerText = '再生';
+            }
+            return;
+        }
+
+        // FaceMesh
+        await faceMesh.send({image: videoElement});
+        // MoveNet MultiPose
+        lastPoseResults = await detectPoses(videoElement);
+        lastImage = videoElement;
+        renderResults();
+
+        videoAnimationId = requestAnimationFrame(processVideoFrame);
+    }
+
+    // ■ イベントリスナー
+    cameraModeBtn.addEventListener('click', startCameraMode);
+    videoModeBtn.addEventListener('click', startVideoMode);
+
+    uploadBtn.addEventListener('click', () => fileInput.click());
+
+    fileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            console.log('ファイル選択:', file.name, file.type, file.size);
+            statusText.innerText = '動画を読み込み中... (' + file.name + ')';
+
+            const url = URL.createObjectURL(file);
+            videoElement.src = url;
+
+            videoElement.onloadeddata = () => {
+                console.log('動画読み込み完了');
+                statusText.innerText = '動画 - 準備完了（再生ボタンを押してください）';
+                playPauseBtn.innerText = '再生';
+            };
+
+            videoElement.onerror = (err) => {
+                console.error('動画エラー:', videoElement.error);
+                statusText.innerText = '動画 - 読み込みエラー: ' + (videoElement.error?.message || '形式非対応の可能性');
+            };
+
+            videoElement.load();
+        }
+    });
+
+    playPauseBtn.addEventListener('click', async () => {
+        if (videoElement.paused) {
+            try {
+                await videoElement.play();
+                playPauseBtn.innerText = '一時停止';
+                processVideoFrame();
+            } catch (err) {
+                console.error('再生エラー:', err);
+                statusText.innerText = '動画 - 再生エラー: ' + err.message;
+            }
+        } else {
+            videoElement.pause();
+            playPauseBtn.innerText = '再生';
+        }
+    });
+
+    restartBtn.addEventListener('click', async () => {
+        videoElement.currentTime = 0;
+        try {
+            await videoElement.play();
+            playPauseBtn.innerText = '一時停止';
+            processVideoFrame();
+        } catch (err) {
+            console.error('再生エラー:', err);
+            statusText.innerText = '動画 - 再生エラー: ' + err.message;
+        }
+    });
+
+    // ■ 初期化
+    async function init() {
+        await initMoveNet();
+        startCameraMode();
+    }
+
+    init();
+</script>
+
+</body>
+</html>
