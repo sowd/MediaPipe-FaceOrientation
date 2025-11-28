@@ -301,11 +301,11 @@
                 // スケルトン（骨格線）を描画
                 drawSkeleton(person.keypoints, posture.color, scaleX, scaleY);
 
-                // 腰の位置に姿勢を表示
-                const hipPos = getHipPosition(person.keypoints, scaleX, scaleY);
-                if (hipPos) {
-                    const px = hipPos.x;
-                    const py = hipPos.y;
+                // 頭の位置に姿勢を表示
+                const headPos = getHeadPosition(person.keypoints, scaleX, scaleY);
+                if (headPos) {
+                    const px = headPos.x;
+                    const py = headPos.y;
 
                     canvasCtx.save();
                     canvasCtx.translate(px, py);
